@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -484,11 +485,40 @@ func (l deviceLib) getGpuInfo(index int, device nvdev.Device) (*GpuInfo, error) 
 		addressingMode = &mode
 	}
 
+	// Get the NUMA node for the device. A value of -1 indicates that NUMA node
+	// information is not available (e.g., on systems without NUMA or when the
+	// NVML call fails).
+	numaNode := -1
+	if node, ret := device.GetNumaNodeId(); ret == nvml.SUCCESS {
+		numaNode = node
+	} else {
+		klog.V(4).Infof("unable to get NUMA node for device %d via NVML (ret=%v), trying sysfs fallback", index, ret)
+		// Fallback: try to read NUMA node from sysfs (works on Azure VMs where NVML doesn't support it)
+		if sysfsNumaNode, err := getNumaNodeFromSysfs(pcieBusID); err == nil {
+			numaNode = sysfsNumaNode
+			klog.V(4).Infof("got NUMA node %d for device %d from sysfs", numaNode, index)
+		} else {
+			klog.V(4).Infof("unable to get NUMA node for device %d from sysfs: %v", index, err)
+		}
+	}
+
 	var pcieRootAttr *deviceattribute.DeviceAttribute
 	if attr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(pcieBusID); err == nil {
 		pcieRootAttr = &attr
 	} else {
-		klog.Warningf("error getting PCIe root for device %d, continuing without attribute: %v", index, err)
+		klog.Warningf("error getting PCIe root for device %d: %v", index, err)
+		// Fallback: try to get the parent PCI device bus ID from sysfs.
+		// This enables GPU-NIC topological alignment on systems where
+		// standard PCIe root resolution fails (e.g., Azure VMs with VMBUS paths).
+		if parentBridge, err := getParentBridgeFromSysfs(pcieBusID); err == nil {
+			pcieRootAttr = &deviceattribute.DeviceAttribute{
+				Name:  resourceapi.QualifiedName(deviceattribute.StandardDeviceAttributePrefix + "pcieRoot"),
+				Value: resourceapi.DeviceAttribute{StringValue: &parentBridge},
+			}
+			klog.Infof("using parent PCI device pcieRoot fallback for device %d: %s", index, parentBridge)
+		} else {
+			klog.V(4).Infof("unable to get parent PCI device for device %d: %v", index, err)
+		}
 	}
 
 	var migProfiles []*MigProfileInfo
@@ -557,6 +587,7 @@ func (l deviceLib) getGpuInfo(index int, device nvdev.Device) (*GpuInfo, error) 
 		cudaDriverVersion:     fmt.Sprintf("%v.%v", cudaDriverVersion/1000, (cudaDriverVersion%1000)/10),
 		pcieBusID:             pcieBusID,
 		pcieRootAttr:          pcieRootAttr,
+		numaNode:              numaNode,
 		migProfiles:           migProfiles,
 		health:                Healthy,
 		addressingMode:        addressingMode,
@@ -613,7 +644,17 @@ func (l deviceLib) getVfioDeviceInfo(idx int, device *nvpci.NvidiaPCIDevice) (*V
 	if err == nil {
 		pcieRootAttr = &attr
 	} else {
-		klog.Warningf("error getting PCIe root for device %s, continuing without attribute: %v", device.Address, err)
+		klog.Warningf("error getting PCIe root for VFIO device %s: %v", device.Address, err)
+		// Fallback: try to get the parent PCI device bus ID from sysfs.
+		if parentBridge, err := getParentBridgeFromSysfs(device.Address); err == nil {
+			pcieRootAttr = &deviceattribute.DeviceAttribute{
+				Name:  resourceapi.QualifiedName(deviceattribute.StandardDeviceAttributePrefix + "pcieRoot"),
+				Value: resourceapi.DeviceAttribute{StringValue: &parentBridge},
+			}
+			klog.Infof("using parent PCI device pcieRoot fallback for VFIO device %s: %s", device.Address, parentBridge)
+		} else {
+			klog.V(4).Infof("unable to get parent PCI device for VFIO device %s: %v", device.Address, err)
+		}
 	}
 
 	_, memoryBytes := device.Resources.GetTotalAddressableMemory(true)
@@ -1296,4 +1337,87 @@ func setMax(m map[resourceapi.QualifiedName]resourceapi.DeviceCapacity, k resour
 	if cur, ok := m[k]; !ok || v.Value.Value() > cur.Value.Value() {
 		m[k] = v
 	}
+}
+
+// getNumaNodeFromSysfs reads the NUMA node for a PCI device from sysfs.
+// This is used as a fallback when NVML doesn't support GetNumaNodeId() (e.g., on Azure VMs).
+// The pciBusID should be in BDF format (e.g., "0001:00:00.0").
+func getNumaNodeFromSysfs(pciBusID string) (int, error) {
+	numaNodePath := filepath.Join("/sys/bus/pci/devices", pciBusID, "numa_node")
+	data, err := os.ReadFile(numaNodePath)
+	if err != nil {
+		return -1, fmt.Errorf("failed to read numa_node from sysfs: %w", err)
+	}
+
+	numaNode, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return -1, fmt.Errorf("failed to parse numa_node value: %w", err)
+	}
+
+	// A value of -1 in sysfs means NUMA node is not applicable/available
+	if numaNode < 0 {
+		return -1, fmt.Errorf("numa_node is %d (not available)", numaNode)
+	}
+
+	return numaNode, nil
+}
+
+// getParentBridgeFromSysfs attempts to find the parent PCI device for a device.
+// It reads the device's sysfs symlink and walks up the directory tree to find
+// a parent PCI device. This returns the parent's bus ID (e.g., "0000:00:01.0").
+// The pciBusID should be in BDF format (e.g., "0001:00:00.0").
+func getParentBridgeFromSysfs(pciBusID string) (string, error) {
+	devicePath := filepath.Join("/sys/bus/pci/devices", pciBusID)
+
+	// Resolve the symlink to get the full device path
+	realPath, err := filepath.EvalSymlinks(devicePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve sysfs symlink: %w", err)
+	}
+
+	// The real path looks like:
+	// Standard PCIe: /sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0
+	// Azure VMBUS:   /sys/devices/LNXSYSTM:00/.../VMBUS:00/{guid}/pci0001:00/0001:00:00.0
+
+	// Walk up the directory tree to find a parent PCI device
+	dir := filepath.Dir(realPath)
+	for dir != "/" && dir != "." {
+		base := filepath.Base(dir)
+
+		// Check if this directory represents a parent PCI device (format: XXXX:XX:XX.X)
+		// Any parent PCI device in the hierarchy can serve as a topology grouping key,
+		// enabling GPU-NIC alignment when both drivers use the same parent.
+		if isPCIBusID(base) && base != pciBusID {
+			return base, nil
+		}
+
+		dir = filepath.Dir(dir)
+	}
+
+	return "", fmt.Errorf("no parent bridge found in sysfs path: %s", realPath)
+}
+
+// isPCIBusID checks if a string matches the PCI bus ID format (XXXX:XX:XX.X)
+func isPCIBusID(s string) bool {
+	if len(s) != 12 {
+		return false
+	}
+	// Format: XXXX:XX:XX.X where X is hex digit
+	for i, c := range s {
+		switch i {
+		case 4, 7:
+			if c != ':' {
+				return false
+			}
+		case 10:
+			if c != '.' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }

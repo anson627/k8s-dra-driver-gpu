@@ -35,7 +35,7 @@ type PartCapacityMap map[resourceapi.QualifiedName]resourceapi.DeviceCapacity
 func (d *GpuInfo) PartDevAttributes() map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
 	// TODO: Consume GetPCIBusIDAttribute from https://github.com/kubernetes/kubernetes/blob/4c5746c0bc529439f78af458f8131b5def4dbe5d/staging/src/k8s.io/dynamic-resource-allocation/deviceattribute/attribute.go#L39
 	pciBusIDAttrName := resourceapi.QualifiedName(deviceattribute.StandardDeviceAttributePrefix + "pciBusID")
-	return map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+	attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 		"type": {
 			StringValue: ptr.To(GpuDeviceType),
 		},
@@ -64,6 +64,13 @@ func (d *GpuInfo) PartDevAttributes() map[resourceapi.QualifiedName]resourceapi.
 			StringValue: &d.pcieBusID,
 		},
 	}
+	// Add numaNode attribute if available (numaNode >= 0 indicates valid NUMA node)
+	if d.numaNode >= 0 {
+		attrs["gpu.nvidia.com/numaNode"] = resourceapi.DeviceAttribute{
+			IntValue: ptr.To(int64(d.numaNode)),
+		}
+	}
+	return attrs
 }
 
 // KEP 4815 device announcement: return the full device capacity for this device
@@ -194,7 +201,7 @@ func (i MigSpec) PartCapacities() PartCapacityMap {
 func (i MigSpec) PartAttributes() map[resourceapi.QualifiedName]resourceapi.DeviceAttribute {
 	// TODO: Consume GetPCIBusIDAttribute from https://github.com/kubernetes/kubernetes/blob/4c5746c0bc529439f78af458f8131b5def4dbe5d/staging/src/k8s.io/dynamic-resource-allocation/deviceattribute/attribute.go#L39
 	pciBusIDAttrName := resourceapi.QualifiedName(deviceattribute.StandardDeviceAttributePrefix + "pciBusID")
-	return map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+	attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 		// TODOMIG:
 		// - do not hard-code "mig"?
 		"type": {
@@ -228,6 +235,13 @@ func (i MigSpec) PartAttributes() map[resourceapi.QualifiedName]resourceapi.Devi
 			StringValue: &i.Parent.pcieBusID,
 		},
 	}
+	// Inherit numaNode from parent GPU if available
+	if i.Parent.numaNode >= 0 {
+		attrs["gpu.nvidia.com/numaNode"] = resourceapi.DeviceAttribute{
+			IntValue: ptr.To(int64(i.Parent.numaNode)),
+		}
+	}
+	return attrs
 }
 
 func capacitiesToCounters(m PartCapacityMap) map[string]resourceapi.Counter {

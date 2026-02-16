@@ -51,6 +51,7 @@ type GpuInfo struct {
 	cudaDriverVersion     string
 	pcieBusID             string
 	pcieRootAttr          *deviceattribute.DeviceAttribute
+	numaNode              int
 	migProfiles           []*MigProfileInfo
 	addressingMode        *string
 	health                HealthStatus
@@ -175,6 +176,12 @@ func (d *GpuInfo) GetDevice() resourceapi.Device {
 			StringValue: d.addressingMode,
 		}
 	}
+	// Add numaNode attribute if available (numaNode >= 0 indicates valid NUMA node)
+	if d.numaNode >= 0 {
+		device.Attributes["gpu.nvidia.com/numaNode"] = resourceapi.DeviceAttribute{
+			IntValue: ptr.To(int64(d.numaNode)),
+		}
+	}
 	return device
 }
 
@@ -261,6 +268,12 @@ func (d *MigDeviceInfo) GetDevice() resourceapi.Device {
 	if d.parent.addressingMode != nil {
 		device.Attributes["addressingMode"] = resourceapi.DeviceAttribute{
 			StringValue: d.parent.addressingMode,
+		}
+	}
+	// Inherit numaNode from parent GPU if available
+	if d.parent.numaNode >= 0 {
+		device.Attributes["gpu.nvidia.com/numaNode"] = resourceapi.DeviceAttribute{
+			IntValue: ptr.To(int64(d.parent.numaNode)),
 		}
 	}
 	return device
